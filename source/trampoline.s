@@ -13,16 +13,8 @@ nroEntrypointTrampoline:
     // Call NRO.
     blr  x2
 
-    // Save retval
-    adrp x1, g_lastRet
-    str  w0, [x1, #:lo12:g_lastRet]
-
-    // Reset stack pointer and load next NRO.
-    adrp x8, __stack_top
-    ldr  x8, [x8, #:lo12:__stack_top]
-    mov  sp, x8
-
-    b    loadNro
+    // exit to home menu
+    b selfExit
 
 .cfi_endproc
 

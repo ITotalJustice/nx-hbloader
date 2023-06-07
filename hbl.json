@@ -232,7 +232,7 @@
         },
         {
             "type": "application_type",
-            "value": 2
+            "value": 1
         },
         {
             "type": "min_kernel_version",
