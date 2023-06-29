@@ -2,9 +2,16 @@
 #include <string.h>
 #include <stdlib.h>
 
-static char g_argv[2048];
-static char g_nextArgv[2048];
-static char g_nextNroPath[FS_MAX_PATH];
+#define EXIT_DETECTION_STR "if this isn't replaced i will exit :)"
+
+static char g_argv[2048] = {0};
+static char g_nextArgv[2048] = {0};
+static char g_nextNroPath[FS_MAX_PATH] = {0};
+static char g_defaultArgv[2048] = {0};
+static char g_defaultNroPath[FS_MAX_PATH] = {0};
+
+static u64 g_nroSize = 0;
+static NroHeader g_nroHeader = {0};
 
 static enum {
     CodeMemoryUnavailable    = 0,
@@ -12,18 +19,20 @@ static enum {
     CodeMemorySameProcess    = BIT(0) | BIT(1),
 } g_codeMemoryCapability = CodeMemoryUnavailable;
 
-static Handle g_procHandle;
+static Handle g_procHandle = {0};
 
-static void*  g_heapAddr;
-static size_t g_heapSize;
+static void*  g_heapAddr = {0};
+static size_t g_heapSize = {0};
 
-static u128 g_userIdStorage;
+static u128 g_userIdStorage = {0};
+
+static u8 g_savedTls[0x100];
 
 // Used by trampoline.s
 u64 g_nroAddr = 0;
+Result g_lastRet = 0;
 
 void NORETURN nroEntrypointTrampoline(const ConfigEntry* entries, u64 handle, u64 entrypoint);
-void selfExit(void);
 
 static u64 calculateMaxHeapSize(void) {
     u64 size = 0;
@@ -143,59 +152,180 @@ static void getCodeMemoryCapability(void) {
     }
 }
 
-static void NORETURN loadNro(void) {
+// Credit to behemoth
+// SOURCE: https://github.com/HookedBehemoth/nx-hbloader/commit/7f8000a41bc5e8a6ad96a097ef56634cfd2fabcb
+static NORETURN void selfExit(void) {
+    Service applet, proxy, self;
+    Result rc=0;
+
+    rc = smInitialize();
+    if (R_FAILED(rc))
+        goto fail0;
+
+    rc = smGetService(&applet, "appletOE");
+    if (R_FAILED(rc))
+        goto fail1;
+
+    const u32 cmd_id = 0;
+    const u64 reserved = 0;
+
+    // GetSessionProxy
+    rc = serviceDispatchIn(&applet, cmd_id, reserved,
+        .in_send_pid = true,
+        .in_num_handles = 1,
+        .in_handles = { g_procHandle },
+        .out_num_objects = 1,
+        .out_objects = &proxy,
+    );
+    if (R_FAILED(rc))
+        goto fail2;
+
+    // GetSelfController
+    rc = serviceDispatch(&proxy, 1,
+        .out_num_objects = 1,
+        .out_objects = &self,
+    );
+    if (R_FAILED(rc))
+        goto fail3;
+
+    // Exit
+    rc = serviceDispatch(&self, 0);
+
+    serviceClose(&self);
+
+fail3:
+    serviceClose(&proxy);
+
+fail2:
+    serviceClose(&applet);
+
+fail1:
+    smExit();
+
+fail0:
+    if (R_SUCCEEDED(rc)) {
+        while(1) svcSleepThread(86400000000000ULL);
+        svcExitProcess();
+        __builtin_unreachable();
+    } else {
+        diagAbortWithResult(rc);
+    }
+}
+
+static void fix_nro_path(char* path, size_t len) {
+    // hbmenu prefixes paths with sdmc: which fsFsOpenFile won't like
+    if (!strncmp(path, "sdmc:/", 6)) {
+        memmove(path, path + 5, len-5);
+    }
+}
+
+void NORETURN loadNro(void) {
     NroHeader* header = NULL;
     size_t rw_size=0;
     Result rc=0;
 
-    // the below romfs code assumes that the romfs was created by me
-    // it does not handle errors and will explode if you try to
-    // use this for anything else.
-    // i simply cba to to parse the romfs rn, its 1am and i have work at 3am :)
-    FsStorage s;
-    romfs_header romfs_header;
-
-    if (R_FAILED(fsOpenDataStorageByCurrentProcess(&s))) {
-        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 50));
+    // check's if the homebrew replaced nro_path.
+    // if so, load new nro, otherwise, exit.
+    if (!strcmp(g_nextArgv, EXIT_DETECTION_STR)) {
+        if (!strcmp(g_nextNroPath, g_defaultNroPath)) {
+            selfExit();
+        } else {
+            strcpy(g_nextNroPath, g_defaultNroPath);
+            strcpy(g_nextArgv, g_defaultNroPath);
+        }
     }
 
-    if (R_FAILED(fsStorageRead(&s, 0, &romfs_header, sizeof(romfs_header)))) {
-        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 51));
+    memcpy((u8*)armGetTls() + 0x100, g_savedTls, 0x100);
+
+    // todo: open fs here
+
+    if (g_nroSize) {
+        // checks if nro was previously mapped, if so, unmap
+        header = &g_nroHeader;
+        rw_size = header->segments[2].size + header->bss_size;
+        rw_size = (rw_size+0xFFF) & ~0xFFF;
+
+        svcBreak(BreakReason_NotificationOnlyFlag | BreakReason_PreUnloadDll, g_nroAddr, g_nroSize);
+
+        // .text
+        rc = svcUnmapProcessCodeMemory(
+            g_procHandle, g_nroAddr + header->segments[0].file_off, ((u64) g_heapAddr) + header->segments[0].file_off, header->segments[0].size);
+
+        if (R_FAILED(rc))
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 24));
+
+        // .rodata
+        rc = svcUnmapProcessCodeMemory(
+            g_procHandle, g_nroAddr + header->segments[1].file_off, ((u64) g_heapAddr) + header->segments[1].file_off, header->segments[1].size);
+
+        if (R_FAILED(rc))
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 25));
+
+       // .data + .bss
+        rc = svcUnmapProcessCodeMemory(
+            g_procHandle, g_nroAddr + header->segments[2].file_off, ((u64) g_heapAddr) + header->segments[2].file_off, rw_size);
+
+        if (R_FAILED(rc))
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 26));
+
+        svcBreak(BreakReason_NotificationOnlyFlag | BreakReason_PostUnloadDll, g_nroAddr, g_nroSize);
+
+        g_nroAddr = g_nroSize = 0;
+    } else {
+        // otherwise, this is the first time launching, read path / argv from romfs
+        FsStorage s;
+        romfs_header romfs_header;
+
+        if (R_FAILED(fsOpenDataStorageByCurrentProcess(&s))) {
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 50));
+        }
+
+        if (R_FAILED(fsStorageRead(&s, 0, &romfs_header, sizeof(romfs_header)))) {
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 51));
+        }
+
+        u8* romfs_dirs = malloc(romfs_header.dirTableSize); // should be 1 entry ("/")
+        u8* romfs_files = malloc(romfs_header.fileTableSize); // should be 2 entries (argv and nro)
+
+        if (!romfs_dirs || !romfs_files) {
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 53));
+        }
+
+        if (R_FAILED(fsStorageRead(&s, romfs_header.dirTableOff, romfs_dirs, romfs_header.dirTableSize))) {
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 54));
+        }
+
+        if (R_FAILED(fsStorageRead(&s, romfs_header.fileTableOff, romfs_files, romfs_header.fileTableSize))) {
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 55));
+        }
+
+        const romfs_dir* dir = (const romfs_dir*)romfs_dirs;
+        const romfs_file* next_argv_file = (const romfs_file*)(romfs_files + dir->childFile);
+        const romfs_file* next_nro_file = (const romfs_file*)(romfs_files + next_argv_file->sibling);
+
+        if (R_FAILED(fsStorageRead(&s, romfs_header.fileDataOff + next_argv_file->dataOff, g_nextArgv, next_argv_file->dataSize))) {
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 56));
+        }
+
+        if (R_FAILED(fsStorageRead(&s, romfs_header.fileDataOff + next_nro_file->dataOff, g_nextNroPath, next_nro_file->dataSize))) {
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 57));
+        }
+
+        free(romfs_dirs);
+        free(romfs_files);
+        fsStorageClose(&s);
+
+        strcpy(g_defaultNroPath, g_nextNroPath);
+        strcpy(g_defaultArgv, g_nextArgv);
     }
 
-    u8* romfs_dirs = malloc(romfs_header.dirTableSize); // should be 1 entry ("/")
-    u8* romfs_files = malloc(romfs_header.fileTableSize); // should be 2 entries (argv and nro)
-
-    if (!romfs_dirs || !romfs_files) {
-        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 53));
-    }
-
-    if (R_FAILED(fsStorageRead(&s, romfs_header.dirTableOff, romfs_dirs, romfs_header.dirTableSize))) {
-        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 54));
-    }
-
-    if (R_FAILED(fsStorageRead(&s, romfs_header.fileTableOff, romfs_files, romfs_header.fileTableSize))) {
-        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 55));
-    }
-
-    const romfs_dir* dir = (const romfs_dir*)romfs_dirs;
-    const romfs_file* next_argv_file = (const romfs_file*)(romfs_files + dir->childFile);
-    const romfs_file* next_nro_file = (const romfs_file*)(romfs_files + next_argv_file->sibling);
-
-    if (R_FAILED(fsStorageRead(&s, romfs_header.fileDataOff + next_argv_file->dataOff, g_nextArgv, next_argv_file->dataSize))) {
-        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 56));
-    }
-
-    if (R_FAILED(fsStorageRead(&s, romfs_header.fileDataOff + next_nro_file->dataOff, g_nextNroPath, next_nro_file->dataSize))) {
-        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 57));
-    }
-
-    free(romfs_dirs);
-    free(romfs_files);
-    fsStorageClose(&s);
+    // fix paths
+    fix_nro_path(g_defaultNroPath, sizeof(g_defaultNroPath));
+    fix_nro_path(g_nextNroPath, sizeof(g_nextNroPath));
+    fix_nro_path(g_nextArgv, sizeof(g_nextArgv));
+    fix_nro_path(g_defaultArgv, sizeof(g_defaultArgv));
 
     memcpy(g_argv, g_nextArgv, sizeof(g_argv));
-
     svcBreak(BreakReason_NotificationOnlyFlag | BreakReason_PreLoadDll, (uintptr_t)g_argv, sizeof(g_argv));
 
     uint8_t *nrobuf = (uint8_t*) g_heapAddr;
@@ -239,11 +369,8 @@ static void NORETURN loadNro(void) {
     fsFileClose(&f);
     fsFsClose(&fs);
 
-    // will this exit without sm being init?
-    fsExit();
-
-    size_t total_size = header->size + header->bss_size;
-    total_size = (total_size+0xFFF) & ~0xFFF;
+    // todo: close fs here
+    // fsExit();
 
     rw_size = header->segments[2].size + header->bss_size;
     rw_size = (rw_size+0xFFF) & ~0xFFF;
@@ -258,8 +385,13 @@ static void NORETURN loadNro(void) {
 
     // todo: Detect whether NRO fits into heap or not.
 
+    // Copy header to elsewhere because we're going to unmap it next.
+    memcpy(&g_nroHeader, header, sizeof(g_nroHeader));
+    header = &g_nroHeader;
+
     // Map code memory to a new randomized address
     virtmemLock();
+    const size_t total_size = (header->size + header->bss_size + 0xFFF) & ~0xFFF;
     void* map_addr = virtmemFindCodeMemory(total_size, 0);
     rc = svcMapProcessCodeMemory(g_procHandle, (u64)map_addr, (u64)nrobuf, total_size);
     virtmemUnlock();
@@ -334,6 +466,8 @@ static void NORETURN loadNro(void) {
     // NextLoadPath
     entries[5].Value[0] = (u64)(uintptr_t)&g_nextNroPath[0];
     entries[5].Value[1] = (u64)(uintptr_t)&g_nextArgv[0];
+    // LastLoadResult
+    entries[6].Value[0] = g_lastRet;
     // RandomSeed
     entries[9].Value[0] = randomGet64();
     entries[9].Value[1] = randomGet64();
@@ -342,73 +476,17 @@ static void NORETURN loadNro(void) {
     entries[11].Value[1] = hosversionIsAtmosphere() ? 0x41544d4f53504852UL : 0; // 'ATMOSPHR'
 
     g_nroAddr = (u64)map_addr;
+    g_nroSize = nro_size;
 
     svcBreak(BreakReason_NotificationOnlyFlag | BreakReason_PostLoadDll, g_nroAddr, nro_size);
+
+    strcpy(g_nextArgv, EXIT_DETECTION_STR);
 
     nroEntrypointTrampoline(&entries[0], -1, g_nroAddr);
 }
 
-// Credit to behemoth
-// SOURCE: https://github.com/HookedBehemoth/nx-hbloader/commit/7f8000a41bc5e8a6ad96a097ef56634cfd2fabcb
-void selfExit(void) {
-    Service applet, proxy, self;
-    Result rc=0;
-
-    rc = smInitialize();
-    if (R_FAILED(rc))
-        goto fail0;
-
-    rc = smGetService(&applet, "appletOE");
-    if (R_FAILED(rc))
-        goto fail1;
-
-    const u32 cmd_id = 0;
-    const u64 reserved = 0;
-
-    // GetSessionProxy
-    rc = serviceDispatchIn(&applet, cmd_id, reserved,
-        .in_send_pid = true,
-        .in_num_handles = 1,
-        .in_handles = { g_procHandle },
-        .out_num_objects = 1,
-        .out_objects = &proxy,
-    );
-    if (R_FAILED(rc))
-        goto fail2;
-
-    // GetSelfController
-    rc = serviceDispatch(&proxy, 1,
-        .out_num_objects = 1,
-        .out_objects = &self,
-    );
-    if (R_FAILED(rc))
-        goto fail3;
-
-    // Exit
-    rc = serviceDispatch(&self, 0);
-
-    serviceClose(&self);
-
-fail3:
-    serviceClose(&proxy);
-
-fail2:
-    serviceClose(&applet);
-
-fail1:
-    smExit();
-
-fail0:
-    if (R_SUCCEEDED(rc)) {
-        while(1) svcSleepThread(86400000000000ULL);
-        svcExitProcess();
-        __builtin_unreachable();
-    } else {
-        diagAbortWithResult(rc);
-    }
-}
-
 int main(int argc, char **argv) {
+    memcpy(g_savedTls, (u8*)armGetTls() + 0x100, 0x100);
     setupHbHeap();
     getOwnProcessHandle();
     getCodeMemoryCapability();

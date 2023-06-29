@@ -1,8 +1,8 @@
 {
-    "name": "hbloader",
-    "title_id": "0x010000000000100D",
-    "title_id_range_min": "0x010000000000100D",
-    "title_id_range_max": "0x010000000000100D",
+    "name": "Application",
+    "title_id": "0x0000000000000000",
+    "title_id_range_min": "0x0000000000000000",
+    "title_id_range_max": "0x0000000000000000",
     "main_thread_stack_size": "0x100000",
     "main_thread_priority": 44,
     "default_cpu_id": 0,
@@ -29,7 +29,7 @@
             "value": {
                 "highest_thread_priority": 59,
                 "lowest_thread_priority": 28,
-                "highest_cpu_id": 2,
+                "highest_cpu_id": 3,
                 "lowest_cpu_id": 0
             }
         },
